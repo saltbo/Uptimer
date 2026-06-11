@@ -21,7 +21,7 @@ import {
 } from '../utils/uptime';
 
 const HEARTBEAT_BARS = 60;
-const AVAILABILITY_BARS = 60;
+const AVAILABILITY_BARS = 30;
 
 type PublicMonitorLike = Pick<
   PublicMonitor,
