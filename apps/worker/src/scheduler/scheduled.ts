@@ -863,6 +863,7 @@ async function hasActiveWebhookChannels(db: D1Database): Promise<boolean> {
 }
 
 const listDueMonitorsStatementByDb = new WeakMap<D1Database, D1PreparedStatement>();
+const hasSchedulableMonitorsStatementByDb = new WeakMap<D1Database, D1PreparedStatement>();
 const persistStatementTemplatesByDb = new WeakMap<D1Database, PersistStatementTemplates>();
 const hasActiveWebhookChannelsStatementByDb = new WeakMap<D1Database, D1PreparedStatement>();
 const activeWebhookPresenceCacheByDb = new WeakMap<
@@ -909,6 +910,15 @@ const LIST_DUE_MONITORS_SQL = `
     AND (s.status IS NULL OR s.status != 'paused')
     AND (s.last_checked_at IS NULL OR s.last_checked_at <= ?1 - m.interval_sec)
   ORDER BY m.id
+`;
+
+const HAS_SCHEDULABLE_MONITORS_SQL = `
+  SELECT 1 AS present
+  FROM monitors m
+  LEFT JOIN monitor_state s ON s.monitor_id = m.id
+  WHERE m.is_active = 1
+    AND (s.status IS NULL OR s.status != 'paused')
+  LIMIT 1
 `;
 
 const PERSIST_STATEMENTS_SQL = {
@@ -963,6 +973,11 @@ export type CompletedDueMonitor = {
   maintenanceSuppressed: boolean;
 };
 
+type InitializedNotifications = {
+  module: typeof import('./notifications') | null;
+  notify: NotifyContext | null;
+};
+
 function toHttpMethod(
   value: string | null,
 ): 'GET' | 'POST' | 'PUT' | 'PATCH' | 'DELETE' | 'HEAD' | null {
@@ -1007,6 +1022,17 @@ async function listDueMonitors(db: D1Database, checkedAt: number): Promise<DueMo
   const { results } = await statement.bind(checkedAt).all<DueMonitorRow>();
 
   return results ?? [];
+}
+
+async function hasSchedulableMonitors(db: D1Database): Promise<boolean> {
+  const cached = hasSchedulableMonitorsStatementByDb.get(db);
+  const statement = cached ?? db.prepare(HAS_SCHEDULABLE_MONITORS_SQL);
+  if (!cached) {
+    hasSchedulableMonitorsStatementByDb.set(db, statement);
+  }
+
+  const row = await statement.first<{ present: number }>();
+  return row !== null;
 }
 
 export async function listMonitorRowsByIds(
@@ -1840,6 +1866,33 @@ export async function runScheduledTick(env: Env, ctx: ExecutionContext): Promise
     return refreshPromise.then(queueShardedPublicSnapshotWork);
   };
 
+  const initializeNotifications = async (): Promise<InitializedNotifications> => {
+    const hasWebhookNotifications = await hasActiveWebhookChannels(env.DB);
+    if (!hasWebhookNotifications) {
+      return { module: null, notify: null };
+    }
+
+    const notificationsModule = await import('./notifications');
+    const notify = await notificationsModule.createNotifyContext(env, ctx);
+    if (notify) {
+      await notificationsModule.emitMaintenanceWindowNotifications(env, notify, now);
+    }
+    return { module: notificationsModule, notify };
+  };
+
+  const queueIdleWork = async (): Promise<void> => {
+    if (shouldLogScheduledRefresh(env)) {
+      console.log('scheduled: idle no runnable monitors');
+    }
+    await initializeNotifications();
+    ctx.waitUntil(queueHomepageRefresh());
+  };
+
+  if (!(await hasSchedulableMonitors(env.DB))) {
+    await queueIdleWork();
+    return;
+  }
+
   const acquired = await acquireLease(env.DB, LOCK_NAME, now, LOCK_LEASE_SECONDS);
   if (!acquired) {
     return;
@@ -1857,33 +1910,32 @@ export async function runScheduledTick(env: Env, ctx: ExecutionContext): Promise
   try {
     const useRuntimeFragmentPipeline = shouldUseScheduledRuntimeFragmentPipeline(env);
 
-    const [settings, due, hasWebhookNotifications] = await Promise.all([
+    const due = await listDueMonitors(env.DB, checkedAt);
+
+    if (due.length === 0) {
+      const hasRunnableMonitor = await hasSchedulableMonitors(env.DB);
+      if (!hasRunnableMonitor) {
+        await queueIdleWork();
+        return;
+      }
+      await initializeNotifications();
+      schedulerLease.assertHeld('queueing homepage refresh');
+      ctx.waitUntil(queueHomepageRefresh());
+      return;
+    }
+
+    const [settings, notifications] = await Promise.all([
       readSettings(env.DB),
-      listDueMonitors(env.DB, checkedAt),
-      hasActiveWebhookChannels(env.DB),
+      initializeNotifications(),
     ]);
     const setupDurMs = performance.now() - totalStart;
-
-    let notificationsModule: typeof import('./notifications') | null = null;
-    let notify: NotifyContext | null = null;
-    if (hasWebhookNotifications) {
-      notificationsModule = await import('./notifications');
-      notify = await notificationsModule.createNotifyContext(env, ctx);
-      if (notify) {
-        await notificationsModule.emitMaintenanceWindowNotifications(env, notify, now);
-      }
-    }
+    const notificationsModule = notifications.module;
+    const notify = notifications.notify;
 
     const stateMachineConfig = {
       failuresToDownFromUp: settings.state_failures_to_down_from_up,
       successesToUpFromDown: settings.state_successes_to_up_from_down,
     };
-
-    if (due.length === 0) {
-      schedulerLease.assertHeld('queueing homepage refresh');
-      ctx.waitUntil(queueHomepageRefresh());
-      return;
-    }
 
     // Maintenance suppression is monitor-scoped.
     const dueMonitorIds = due.map((m) => m.id);
