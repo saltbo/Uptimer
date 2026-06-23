@@ -67,6 +67,7 @@ type CreateEnvOptions = {
   startedWindows?: unknown[];
   endedWindows?: unknown[];
   windowMonitorLinks?: unknown[];
+  schedulableMonitorPresent?: boolean | boolean[];
   onRun?: (normalizedSql: string, args: unknown[]) => void;
 };
 
@@ -78,8 +79,19 @@ function createEnv(options: CreateEnvOptions = {}): Env {
     startedWindows = [],
     endedWindows = [],
     windowMonitorLinks = [],
+    schedulableMonitorPresent = true,
     onRun,
   } = options;
+  const schedulableMonitorResults = Array.isArray(schedulableMonitorPresent)
+    ? [...schedulableMonitorPresent]
+    : null;
+  const schedulableMonitorFallback = Array.isArray(schedulableMonitorPresent)
+    ? (schedulableMonitorPresent.at(-1) ?? false)
+    : schedulableMonitorPresent;
+  const readSchedulableMonitorPresent = () =>
+    schedulableMonitorResults
+      ? (schedulableMonitorResults.shift() ?? schedulableMonitorFallback)
+      : schedulableMonitorFallback;
 
   const handlers: FakeD1QueryHandler[] = [
     {
@@ -90,6 +102,12 @@ function createEnv(options: CreateEnvOptions = {}): Env {
     {
       match: 'from notification_channels',
       all: () => channels,
+    },
+    {
+      match: (normalizedSql) =>
+        normalizedSql.includes('select 1 as present') &&
+        normalizedSql.includes('from monitors m'),
+      first: () => (readSchedulableMonitorPresent() ? { present: 1 } : null),
     },
     {
       match: 'from monitors m',
@@ -313,7 +331,7 @@ describe('scheduler/scheduled regression', () => {
     await expect(listMonitorRowsByIds(env.DB, [0, -1])).resolves.toEqual([]);
   });
 
-  it('returns without background work when no monitors are due', async () => {
+  it('queues homepage refresh when monitors are runnable but none are due', async () => {
     const env = createEnv({ dueRows: [] });
     const waitUntil = vi.fn();
     const expectedNow = Math.floor(Date.now() / 1000);
@@ -321,7 +339,7 @@ describe('scheduler/scheduled regression', () => {
     await runScheduledTick(env, { waitUntil } as unknown as ExecutionContext);
 
     expect(acquireLease).toHaveBeenCalledWith(env.DB, 'scheduler:tick', expectedNow, 135);
-    expect(readSettings).toHaveBeenCalledTimes(1);
+    expect(readSettings).not.toHaveBeenCalled();
     expect(waitUntil).toHaveBeenCalledTimes(1);
     await Promise.all(waitUntil.mock.calls.map((call) => call[0] as Promise<unknown>));
     expect(refreshPublicHomepageSnapshotIfNeeded).toHaveBeenCalledWith({
@@ -337,6 +355,112 @@ describe('scheduler/scheduled regression', () => {
       baseSnapshot: null,
       baseSnapshotBodyJson: null,
     });
+  });
+
+  it('skips monitor scheduling but keeps idle public refresh and maintenance notifications', async () => {
+    const now = Math.floor(Date.now() / 1000);
+    const env = createEnv({
+      dueRows: [],
+      schedulableMonitorPresent: false,
+      channels: [
+        {
+          id: 1,
+          name: 'webhook',
+          config_json: JSON.stringify({
+            url: 'https://hooks.example.com/uptimer',
+            method: 'POST',
+            payload_type: 'json',
+          }),
+          created_at: now - 3600,
+        },
+      ],
+      startedWindows: [
+        {
+          id: 1,
+          title: 'Deploy',
+          message: null,
+          starts_at: now - 60,
+          ends_at: now + 60,
+          created_at: now - 3600,
+        },
+      ],
+      windowMonitorLinks: [{ maintenance_window_id: 1, monitor_id: 301 }],
+    });
+    const waitUntil = vi.fn();
+
+    await runScheduledTick(env, { waitUntil } as unknown as ExecutionContext);
+
+    expect(acquireLease).not.toHaveBeenCalled();
+    expect(readSettings).not.toHaveBeenCalled();
+    expect(waitUntil).toHaveBeenCalledTimes(2);
+    await Promise.all(waitUntil.mock.calls.map((call) => call[0] as Promise<unknown>));
+    expect(refreshPublicHomepageSnapshotIfNeeded).toHaveBeenCalledWith({
+      db: env.DB,
+      now,
+      compute: expect.any(Function),
+      seedDataSnapshot: true,
+    });
+    expect(computePublicHomepagePayload).not.toHaveBeenCalled();
+    expect(dispatchWebhookToChannels).toHaveBeenCalledWith(
+      expect.objectContaining({
+        eventType: 'maintenance.started',
+        eventKey: `maintenance:1:started:${now - 60}`,
+        channels: [expect.objectContaining({ id: 1 })],
+      }),
+    );
+  });
+
+  it('keeps idle public refresh and maintenance notifications after a post-lease pause race', async () => {
+    const now = Math.floor(Date.now() / 1000);
+    const env = createEnv({
+      dueRows: [],
+      schedulableMonitorPresent: [true, false],
+      channels: [
+        {
+          id: 1,
+          name: 'webhook',
+          config_json: JSON.stringify({
+            url: 'https://hooks.example.com/uptimer',
+            method: 'POST',
+            payload_type: 'json',
+          }),
+          created_at: now - 3600,
+        },
+      ],
+      startedWindows: [
+        {
+          id: 1,
+          title: 'Deploy',
+          message: null,
+          starts_at: now - 60,
+          ends_at: now + 60,
+          created_at: now - 3600,
+        },
+      ],
+      windowMonitorLinks: [{ maintenance_window_id: 1, monitor_id: 301 }],
+    });
+    const waitUntil = vi.fn();
+
+    await runScheduledTick(env, { waitUntil } as unknown as ExecutionContext);
+
+    expect(acquireLease).toHaveBeenCalledTimes(1);
+    expect(releaseLease).toHaveBeenCalledTimes(1);
+    expect(readSettings).not.toHaveBeenCalled();
+    expect(waitUntil).toHaveBeenCalledTimes(2);
+    await Promise.all(waitUntil.mock.calls.map((call) => call[0] as Promise<unknown>));
+    expect(refreshPublicHomepageSnapshotIfNeeded).toHaveBeenCalledWith({
+      db: env.DB,
+      now,
+      compute: expect.any(Function),
+      seedDataSnapshot: true,
+    });
+    expect(dispatchWebhookToChannels).toHaveBeenCalledWith(
+      expect.objectContaining({
+        eventType: 'maintenance.started',
+        eventKey: `maintenance:1:started:${now - 60}`,
+        channels: [expect.objectContaining({ id: 1 })],
+      }),
+    );
   });
 
   it('self-invokes homepage refresh via service binding when SELF is configured', async () => {
